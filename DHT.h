@@ -10,27 +10,53 @@
  * Features & History:
  * See DHT.cpp
  */
-
 #ifndef DHT_H
 #define DHT_H
+
 #if ARDUINO >= 100
  #include "Arduino.h"
+
+ #define PULLUP_PIN(x) pinMode(x, INPUT_PULLUP)
+
 #else
  #include "WProgram.h"
+
+ #define PULLUP_PIN(x) pinMode(x, INPUT); \
+					   digitalWrite(x, HIGH)
 #endif
 
-#define DHT_DEBUG 0 //Change to 1 for debug output
+#define DHT_CELSIUS 0
+#define DHT_FARENHEIT 1
+#define DHT_RUNTIME 2
+
+/*************** USER DEFINED SWITCHES ***************/
+
+//Change to 1 for debug output
+#define DHT_DEBUG 0
+
+//If set to 1, will not re trigger a read if attempting to use old readings
+#define NO_AUTOREFRESH 0
+
+/* Your choices are:
+ * DHT_CELSIUS: Smallest code size.
+ * DHT_FARENHEIT: Bigger code size. (+84 bytes on ESP8266 arch)
+ * DHT_RUNTIME: Most flexible, compatible with Adafruit's lib.
+ * 				(+124 bytes over DHT_CELSIUS for ESP8266 arch)
+ * */
+#define DHT_TEMPERATURE DHT_RUNTIME
+
+/*************** SYSTEM CONSTANTS ***************/
 
 /*From datasheet: http://www.micro4you.com/files/sensor/DHT11.pdf
  * '0' if HIGH lasts 26-28us,
- * '1' if HIGH lasts 70us
- */
+ * '1' if HIGH lasts 70us */
 #define ONE_DURATION_THRESH_US 30
 
-#define DHTLIB_DHT11_WAKEUP         18
-#define DHTLIB_DHT22_WAKEUP         5
+#define DHTLIB_DHT11_WAKEUP 18
+#define DHTLIB_DHT22_WAKEUP 5
 
-// how many timing transitions we need to keep track of. 2 * number bits + extra
+// how many timing transitions we need
+// to keep track of. 2 * 40 bits + extra
 #define MAXTIMINGS 85
 
 #define DHT_AUTO 0
@@ -51,6 +77,8 @@
 
 #define WAKEUP_DHT11 18
 #define WAKEUP_DHT22 1
+
+#define LAST_VALUE -1
 
 // Reference: http://epb.apogee.net/res/refcomf.asp
 enum ComfortState
@@ -74,13 +102,62 @@ enum ErrorDHT
 	errDHT_Other,
 };
 
+struct TempAndHumidity
+{
+	float temp;
+	float humid;
+};
+
+struct ComfortProfile
+{
+	//Represent the 4 line equations:
+	//dry, humid, hot, cold, using the y = mx + b formula
+	float m_tooHot_m, m_tooHot_b;
+	float m_tooCold_m, m_tooHCold_b;
+	float m_tooDry_m, m_tooDry_b;
+	float m_tooHumid_m, m_tooHumid_b;
+
+	inline bool isTooHot(float temp, float humidity)
+		{return (temp > (humidity * m_tooHot_m + m_tooHot_b));}
+	inline bool isTooHumid(float temp, float humidity)
+		{return (temp > (humidity * m_tooHumid_m + m_tooHumid_b));}
+	inline bool isTooCold(float temp, float humidity)
+		{return (temp < (humidity * m_tooCold_m + m_tooHCold_b));}
+	inline bool isTooDry(float temp, float humidity)
+		{return (temp < (humidity * m_tooDry_m + m_tooDry_b));}
+
+	inline float distanceTooHot(float temp, float humidity)
+		{return temp - (humidity * m_tooHot_m + m_tooHot_b);}
+	inline float distanceTooHumid(float temp, float humidity)
+		{return temp - (humidity * m_tooHumid_m + m_tooHumid_b);}
+	inline float distanceTooCold(float temp, float humidity)
+		{return (humidity * m_tooCold_m + m_tooHCold_b) - temp;}
+	inline float distanceTooDry(float temp, float humidity)
+		{return (humidity * m_tooDry_m + m_tooDry_b) - temp;}
+};
+
 class DHT
 {
 public:
-	DHT(uint8_t pin, uint8_t type = DHT_AUTO, boolean pullup = false,
-			uint16_t maxIntervalRead = READ_INTERVAL_DONT_CARE)
-		: m_kSensorPin(pin), m_kSensorType(type),
-		  m_bPullupEnabled(pullup), m_lastreadtime(0), m_maxIntervalRead(maxIntervalRead)
+	/*********************** STATIC METHODS ***********************/
+	/*can be used without an object ex DHT::convertCtoF(33.2)     */
+
+	static inline float convertCtoF(float c){ return c * 1.8f + 32; }
+	static inline float convertFtoC(float f){ return (f-32)/1.8f; }
+
+	/*********************** REGULAR METHODS ***********************/
+	/*must be called with an object ex dht.begin()                 */
+
+	/**
+	 * Constructor.
+	 * @param pin - the GPIO [in number the sensor is hooked up to
+	 * @param type - the sensor type
+	 * @param minIntervalRead - The minimum time between reads in ms
+	 * */
+	DHT(uint8_t pin,
+		uint8_t type = DHT_AUTO,
+		uint16_t minIntervalRead = READ_INTERVAL_DONT_CARE)
+		: m_kSensorPin(pin), m_kSensorType(type), m_minIntervalRead(minIntervalRead)
 	{
 		m_lastError = errDHT_Other;
 		m_lastTemp = NAN;
@@ -88,20 +165,22 @@ public:
 
 		if (DHT11 == m_kSensorType)
 		{
-			if (READ_INTERVAL_DONT_CARE == maxIntervalRead)
+			if (READ_INTERVAL_DONT_CARE == minIntervalRead)
 			{
-				m_maxIntervalRead = READ_INTERVAL_DHT11_DSHEET;
+				m_minIntervalRead = READ_INTERVAL_DHT11_DSHEET;
 			}
 			m_wakeupTimeMs = WAKEUP_DHT11;
 		}
 		else if (DHT22 == m_kSensorType || DHT21 == m_kSensorType)
 		{
-			if (READ_INTERVAL_DONT_CARE == maxIntervalRead)
+			if (READ_INTERVAL_DONT_CARE == minIntervalRead)
 			{
-				m_maxIntervalRead = READ_INTERVAL_DHT22_DSHEET;
+				m_minIntervalRead = READ_INTERVAL_DHT22_DSHEET;
 			}
 			m_wakeupTimeMs = WAKEUP_DHT22;
 		}
+
+		//Set default comfort profile.
 
 		//In computing these constants the following reference was used
 		//http://epb.apogee.net/res/refcomf.asp
@@ -112,79 +191,143 @@ public:
 		//On the X axis we have the rel humidity in % and on the Y axis the temperature in *C
 
 		//Too hot line AB
-		m_tooHot_m = -0.095;
-		m_tooHot_b = 32.85;
+		m_comfort.m_tooHot_m = -0.095;
+		m_comfort.m_tooHot_b = 32.85;
 		//Too humid line BC
-		m_tooHumid_m =  -56.5;
-		m_tooHumid_b = 3981.2;
+		m_comfort.m_tooHumid_m =  -56.5;
+		m_comfort.m_tooHumid_b = 3981.2;
 		//Too cold line DC
-		m_tooCold_m = -0.04175;
-		m_tooHCold_b = 23.476675;
+		m_comfort.m_tooCold_m = -0.04175;
+		m_comfort.m_tooHCold_b = 23.476675;
 		//Too dry line AD
-		m_tooDry_m = -77.8;
-		m_tooDry_b = 2364;
+		m_comfort.m_tooDry_m = -77.8;
+		m_comfort.m_tooDry_b = 2364;
 	};
 
-	void begin(void);
+	/**
+	 * Must be called once at startup
+	 * */
+	void begin();
 
-	float readTemperature(bool bFarenheit = false);
-	float readHumidity(void);
-	bool readTempAndHumidity(float* temp, float* humid, bool bFarenheit = false);
+	/**
+	 * Read temperature. Compatible with Adafruit's lib(only for DHT_RUNTIME)
+	 * @param bFarenheit - true if a conversion to Farenheit is desired
+	 * */
+	float readTemperature(
+#if DHT_TEMPERATURE == 	DHT_RUNTIME
+			bool bFarenheit = false
+#endif
+	);
 
-	inline float convertCtoF(float c){ return c * 1.8f + 32; }
-	inline float convertFtoC(float f){ return (f-32)/1.8f; }
+	/**
+	 * Read humidity. Compatible with Adafruit's lib
+	 * */
+	float readHumidity();
 
-	float getHeatIndexC(float tempCelsius, float percentHumidity);
-	float getHeatIndexF(float tempFahrenheit, float percentHumidity);
-	double getDewPoint(float tempCelsius, float percentHumidity,
-			uint8_t algType = DEW_ACCURATE_FAST);
+	/**
+	 * Read both temperature and humidity.
+	 * @param destReading - will hold the temp and humidity readings
+	 * @param bFarenheit - true if a conversion to Farenheit is desired
+	 * */
+	bool readTempAndHumidity(TempAndHumidity& destReading
+#if DHT_TEMPERATURE == 	DHT_RUNTIME
+			, bool bFarenheit = false
+#endif
+	);
 
-	float getComfortRatio(float tCelsius, float humidity, ComfortState& comfort);
+	//Get and set the current comfort profile
+	ComfortProfile getComfortProfile() {return m_comfort;}
+	void setComfortProfile(ComfortProfile& c) {m_comfort = c;}
 
-	inline bool isTooHot(float tCelsius, float humidity)
-		{return (tCelsius > (humidity * m_tooHot_m + m_tooHot_b));}
-	inline bool isTooHumid(float tCelsius, float humidity)
-		{return (tCelsius > (humidity * m_tooHumid_m + m_tooHumid_b));}
-	inline bool isTooCold(float tCelsius, float humidity)
-		{return (tCelsius < (humidity * m_tooCold_m + m_tooHCold_b));}
-	inline bool isTooDry(float tCelsius, float humidity)
-		{return (tCelsius < (humidity * m_tooDry_m + m_tooDry_b));}
+	/* Interrogate the current comfort profile for cold,hot,humid,dry states
+	*  If default LAST_VALUE value is used, will take into account the last read values.
+	*
+	*  Automatically starts a new read if values are old.
+	*  This can be disabled by the global switch NO_AUTOREFRESH
+	*  */
+	inline bool isTooHot(float temp = LAST_VALUE, float humidity = LAST_VALUE)
+		{return m_comfort.isTooHot(temp, humidity);}
+	inline bool isTooHumid(float temp = LAST_VALUE, float humidity = LAST_VALUE)
+		{return m_comfort.isTooHumid(temp, humidity);}
+	inline bool isTooCold(float temp = LAST_VALUE, float humidity = LAST_VALUE)
+		{return m_comfort.isTooCold(temp, humidity);}
+	inline bool isTooDry(float temp = LAST_VALUE, float humidity = LAST_VALUE)
+		{return m_comfort.isTooDry(temp, humidity);}
 
-	inline ErrorDHT getm_lastError() { return m_lastError; }
+	/**
+	 * Get the calculated HEAT INDEX
+	 * @param tempCelsius - temp in *C. Default uses the last temp reading.
+	 * 						If the reading is old, a read() is triggered
+	 * 						This can be disabled with the NO_AUTOREFRESH switch
+	 * @param percentHumidity - humidity 0..100. Default uses the last humid reading.
+	 * 						If the reading is old, a read() is triggered
+	 * 						This can be disabled with the NO_AUTOREFRESH switch
+	 * @param bFarenheit - true if a conversion to Farenheit is desired
+	 */
+	float getHeatIndex(float tempCelsius = LAST_VALUE, float percentHumidity = LAST_VALUE
+#if DHT_TEMPERATURE == 	DHT_RUNTIME
+					, bool bFarenheit = false
+#endif
+	);
+
+	/**
+	 * Get the calculated DEW POINT
+	 * @param tempCelsius - temp in *C. Default uses the last temp reading.
+	 * 						If the reading is old, a read() is triggered
+	 * 						This can be disabled with the NO_AUTOREFRESH switch
+	 * @param percentHumidity - humidity 0..100. Default uses the last humid reading.
+	 * 						If the reading is old, a read() is triggered
+	 * 						This can be disabled with the NO_AUTOREFRESH switch
+	 * @param algType - Algorithm type to use. See DHT.c for details
+	 */
+	double getDewPoint(uint8_t algType = DEW_ACCURATE_FAST,
+						float tempCelsius = LAST_VALUE,
+						float percentHumidity = LAST_VALUE
+#if DHT_TEMPERATURE == 	DHT_RUNTIME
+						, bool bFarenheit = false
+#endif
+	);
+
+	/**
+	 * Get the heuristic COMFORT RATIO (0=unconfortable..100=confortable)
+	 * 	based on current comfort profile.
+	 * @param tempCelsius - temp in *C. Default uses the last temp reading.
+	 * 						If the reading is old, a read() is triggered
+	 * 						This can be disabled with the NO_AUTOREFRESH switch
+	 * @param percentHumidity - humidity 0..100. Default uses the last humid reading.
+	 * 						If the reading is old, a read() is triggered
+	 * 						This can be disabled with the NO_AUTOREFRESH switch
+	 * @param destComfStatus - will receive a comfort classification
+	 */
+	float getComfortRatio(ComfortState& destComfStatus,
+						 float temp = LAST_VALUE,
+						 float percentHumidity = LAST_VALUE);
+
+	/**
+	 * Gets the last occurred error.
+	 */
+	inline ErrorDHT getLastError() { return m_lastError; }
+
 private:
-	bool read(void);
+	bool read();
 	void updateInternalCache();
-	
-	inline float distanceTooHot(float tCelsius, float humidity)
-		{return tCelsius - (humidity * m_tooHot_m + m_tooHot_b);}
-	inline float distanceTooHumid(float tCelsius, float humidity)
-		{return tCelsius - (humidity * m_tooHumid_m + m_tooHumid_b);}
-	inline float distanceTooCold(float tCelsius, float humidity)
-		{return (humidity * m_tooCold_m + m_tooHCold_b) - tCelsius;}
-	inline float distanceTooDry(float tCelsius, float humidity)
-		{return (humidity * m_tooDry_m + m_tooDry_b) - tCelsius;}	
 	
 	uint8_t m_kSensorPin, m_kSensorType;
 	uint8_t m_data[6];
 	unsigned long m_lastreadtime;
 	uint8_t m_wakeupTimeMs;
 
-	boolean m_bPullupEnabled;
+	ComfortProfile m_comfort;
+
 	ErrorDHT m_lastError;
 
 	//The datasheet advises to read no more than one every 2 seconds.
 	//However if reads are done at greater intervals the sensor's output
 	//will be less subject to self-heating
 	//Reference: http://www.kandrsmith.org/RJS/Misc/dht_sht_how_fast.html
-	uint16_t m_maxIntervalRead;
+	uint16_t m_minIntervalRead;
 
-	//Represent the 4 line equations:
-	//dry, humid, hot, cold, using the y = mx + b formula
-	float m_tooHot_m, m_tooHot_b;
-	float m_tooCold_m, m_tooHCold_b;
-	float m_tooDry_m, m_tooDry_b;
-	float m_tooHumid_m, m_tooHumid_b;
-
+	//internal cache, last read values
 	float m_lastTemp, m_lastHumid;
 };
 #endif

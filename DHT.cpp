@@ -8,20 +8,22 @@
  *        heat-index and other goodies.
  *
  * Features:
- *  1. Autodetection of sensor type
- *	2. Read humidity and temperature in one function call.
- *	3. Determine heat index in *C or *F
- *	4. Determine dewpoint with various algorithms(speed vs accuracy)
- *	5. Determine thermal comfort
- *		* Empiric comfort function based on comfort profiles
- *		* Multiple comfort profiles. Default based on http://epb.apogee.net/res/refcomf.asp
+ *  1. Autodetection of sensor type.
+ *	2. Determine heat index.
+ *	3. Determine dewpoint with various algorithms(speed vs accuracy).
+ *	4. Determine thermal comfort:
+ *		* Empiric comfort function based on comfort profiles(parametric lines)
+ *		* Multiple comfort profiles possible. Default based on http://epb.apogee.net/res/refcomf.asp
  *		* Determine if it's too cold, hot, humid, dry, based on current comfort profile
+ *  5. Should be compatible with both pre 1.0.1 and later Arduino versions - NOT TESTED
+ *  6. Optimized for sensor read speed(~5ms for DHT22), stack and code size.
+ *		*Select output between *C(smallest code size), *F, or runtime-defined via fct param.
+ *	7. Compatible w/ Adafruit's lib but can also read both humidity and temp. at the same time.
  *
  * History:
- * x/xx/xx -----:	TODO: Comfort profiles
  * 7/04/15 ADiea:	[experimental] comfort function; code reorganization; Autodetection;
  * 7/02/15 ADiea:	dew point algorithms
- * 6/25/15 ADiea: 	pullup option; read temp and humidity in one function call
+ * 6/25/15 ADiea: 	read temp and humidity in one function call
  *  	 	 	 	cache converted value for last temp and humid
  * 6/20/15 cloned from https://github.com/adafruit/DHT-sensor-library
  * -/--/-- written by Adafruit Industries
@@ -52,14 +54,14 @@
 
 #include "DHT.h"
 
-void DHT::begin(void)
+void DHT::begin()
 {
 	//Pull the pin high to put the sensor in idle state
 	pinMode(m_kSensorPin, OUTPUT);
 	digitalWrite(m_kSensorPin, HIGH);
 
 	//Make sure the first read() will happen
-	m_lastreadtime = millis() - m_maxIntervalRead;
+	m_lastreadtime = millis() - m_minIntervalRead;
 
 	//Delay 250ms at least before the first read, so the sensor sees a stable
 	//pin HIGH output
@@ -76,19 +78,22 @@ void DHT::begin(void)
 		if(m_lastError != errDHT_Timeout)
 		{
 			m_kSensorType = DHT22;
-			if (READ_INTERVAL_DONT_CARE == m_maxIntervalRead)
+			if (READ_INTERVAL_DONT_CARE == m_minIntervalRead)
 			{
-				m_maxIntervalRead = READ_INTERVAL_DHT22_DSHEET;
+				m_minIntervalRead = READ_INTERVAL_DHT22_DSHEET;
 			}
 			m_wakeupTimeMs = WAKEUP_DHT22;
 			Serial.println("libDHT: Detected DHT-22 compatible sensor.");
+
+			if(m_lastError == errDHT_OK)
+				updateInternalCache();
 		}
 		else /* If sensor timedout it's probably a DHT11 */
 		{
 			m_kSensorType = DHT11;
-			if (READ_INTERVAL_DONT_CARE == m_maxIntervalRead)
+			if (READ_INTERVAL_DONT_CARE == m_minIntervalRead)
 			{
-				m_maxIntervalRead = READ_INTERVAL_DHT11_DSHEET;
+				m_minIntervalRead = READ_INTERVAL_DHT11_DSHEET;
 			}
 			m_wakeupTimeMs = WAKEUP_DHT11;
 			Serial.println("libDHT: Detected DHT-11 compatible sensor.");
@@ -96,14 +101,24 @@ void DHT::begin(void)
 	}
 }
 
-float DHT::readTemperature(bool bFarenheit/* = false*/)
+float DHT::readTemperature(
+#if DHT_TEMPERATURE == 	DHT_RUNTIME
+			bool bFarenheit/* = false*/
+#endif
+							)
 {
 	read();
-	if (NAN != m_lastTemp && bFarenheit)
+#if ((DHT_TEMPERATURE == DHT_RUNTIME) || (DHT_TEMPERATURE == DHT_FARENHEIT))
+	if ((NAN != m_lastTemp)
+#if (DHT_TEMPERATURE == DHT_RUNTIME)
+			&& bFarenheit
+#endif
+	)
 		return convertCtoF(m_lastTemp);
-	else
-		return m_lastTemp;
+#endif
+	return m_lastTemp;
 }
+
 
 float DHT::readHumidity(void)
 {
@@ -111,58 +126,101 @@ float DHT::readHumidity(void)
 	return m_lastHumid;
 }
 
-bool DHT::readTempAndHumidity(float* temp, float* humid, bool bFarenheit/* = false*/)
+
+bool DHT::readTempAndHumidity(TempAndHumidity& destReading
+#if DHT_TEMPERATURE == 	DHT_RUNTIME
+			, bool bFarenheit/* = false*/
+#endif
+)
 {
 	bool bSuccess = false;
 
 	if (read())
 	{
-		if(temp)
-		{
-			*temp = m_lastTemp;
-			if(bFarenheit)
-			{
-				*temp = convertCtoF(*temp);
-			}
-		}
-		if(humid)
-		{
-			*humid = m_lastHumid;
-		}
+#if ((DHT_TEMPERATURE == DHT_RUNTIME) || (DHT_TEMPERATURE == DHT_FARENHEIT))
+#if (DHT_TEMPERATURE == DHT_RUNTIME)
+		if(bFarenheit)
+#endif
+			destReading.temp = convertCtoF(m_lastTemp);
+#if (DHT_TEMPERATURE == DHT_RUNTIME)
+		else
+			destReading.temp = m_lastTemp;
+#endif
+#else
+			destReading.temp = m_lastTemp;
+#endif
+
+		destReading.humid = m_lastHumid;
+
 		bSuccess = true;
 	}
 	return bSuccess;
 }
 
-float DHT::getHeatIndexF(float tempFahrenheit, float percentHumidity)
-{
-// Adapted from equation at: https://github.com/adafruit/DHT-sensor-library/issues/9 and
-// Wikipedia: http://en.wikipedia.org/wiki/Heat_index
-	float t2F = tempFahrenheit * tempFahrenheit;
-	float h2 = percentHumidity * percentHumidity;
 
-	return -42.379 + 2.04901523 * tempFahrenheit + 10.14333127 * percentHumidity
-			+ -0.22475541 * tempFahrenheit * percentHumidity + -0.00683783 * t2F
-			+ -0.05481717 * h2 + 0.00122874 * t2F * percentHumidity
-			+ 0.00085282 * tempFahrenheit * h2 + -0.00000199 * t2F * h2;
-}
-
-float DHT::getHeatIndexC(float tempCelsius, float percentHumidity)
+float DHT::getHeatIndex(float tempCelsius/*= LAST_VALUE*/,
+						 float percentHumidity/*= LAST_VALUE*/
+#if DHT_TEMPERATURE == 	DHT_RUNTIME
+						 , bool bFarenheit/* = false*/
+#endif
+					)
 {
-// Adapted from equation at: https://github.com/adafruit/DHT-sensor-library/issues/9 and
-// Wikipedia: http://en.wikipedia.org/wiki/Heat_index
+	if(LAST_VALUE == tempCelsius)
+	{
+#if !NO_AUTOREFRESH
+		if(!read())
+			return NAN;
+#endif
+		tempCelsius = m_lastTemp;
+		if(LAST_VALUE == percentHumidity)
+		{
+			percentHumidity = m_lastHumid;
+		}
+	}
+	// Adapted from equation at: https://github.com/adafruit/DHT-sensor-library/issues/9 and
+	// Wikipedia: http://en.wikipedia.org/wiki/Heat_index
 	float t2C = tempCelsius * tempCelsius;
-	float h2 = percentHumidity * percentHumidity;
+	float x = percentHumidity * percentHumidity;
 
-	return -8.784695 + 1.61139411 * tempCelsius + 2.33854900 * percentHumidity
+	x = -8.784695 + 1.61139411 * tempCelsius + 2.33854900 * percentHumidity
 			+ -0.14611605 * tempCelsius * percentHumidity + -0.01230809 * t2C
-			+ -0.01642482 * h2 + 0.00221173 * t2C * percentHumidity
-			+ 0.00072546 * tempCelsius * h2 + -0.00000358 * t2C * h2;
+			+ -0.01642482 * x + 0.00221173 * t2C * percentHumidity
+			+ 0.00072546 * tempCelsius * x + -0.00000358 * t2C * x;
+#if ((DHT_TEMPERATURE == DHT_RUNTIME) || (DHT_TEMPERATURE == DHT_FARENHEIT))
+#if (DHT_TEMPERATURE == DHT_RUNTIME)
+	if(bFarenheit)
+#endif
+		x = convertCtoF(x);
+#endif
+	return x;
 }
 
-double DHT::getDewPoint(float tempCelsius, float percentHumidity, uint8_t algType /*= DEW_ACCURATE_FAST*/)
+
+double DHT::getDewPoint(uint8_t algType /*= DEW_ACCURATE_FAST*/,
+						float tempCelsius/*= LAST_VALUE*/,
+						float percentHumidity/*= LAST_VALUE*/
+#if DHT_TEMPERATURE == 	DHT_RUNTIME
+						 , bool bFarenheit/* = false*/
+#endif
+		)
 {
 	double result = NAN;
+	if(LAST_VALUE == tempCelsius)
+	{
+#if !NO_AUTOREFRESH
+		if(!read())
+		{
+			return NAN;
+		}
+
+#endif
+		tempCelsius = m_lastTemp;
+		if(LAST_VALUE == percentHumidity)
+		{
+			percentHumidity = m_lastHumid;
+		}
+	}
+
 	percentHumidity = percentHumidity * 0.01;
 
 	switch(algType)
@@ -286,20 +344,40 @@ double DHT::getDewPoint(float tempCelsius, float percentHumidity, uint8_t algTyp
 		break;
 	};
 
+#if ((DHT_TEMPERATURE == DHT_RUNTIME) || (DHT_TEMPERATURE == DHT_FARENHEIT))
+#if (DHT_TEMPERATURE == DHT_RUNTIME)
+	if(bFarenheit)
+#endif
+	result = convertCtoF(result);
+#endif
 	return result;
 }
 
-float DHT::getComfortRatio(float tCelsius, float humidity, ComfortState& comfort)
+float DHT::getComfortRatio(ComfortState& destComfortStatus,
+		 float temperature/* = LAST_VALUE*/,
+		 float percentHumidity/* = LAST_VALUE*/)
 {
+	if(LAST_VALUE == temperature)
+	{
+#if !NO_AUTOREFRESH
+		if(!read())
+			return NAN;
+#endif
+		temperature = m_lastTemp;
+		if(LAST_VALUE == percentHumidity)
+		{
+			percentHumidity = m_lastHumid;
+		}
+	}
 	float ratio = 100; //100%
 	float distance = 0;
 	float kTempFactor = 3; //take into account the slope of the lines
 	float kHumidFactor = 0.1; //take into account the slope of the lines
 	uint8_t tempComfort = 0;
 	
-	comfort = Comfort_OK;
+	destComfortStatus = Comfort_OK;
 
-	distance = distanceTooHot(tCelsius, humidity);
+	distance = m_comfort.distanceTooHot(temperature, percentHumidity);
 	if(distance > 0)
 	{
 		//update the comfort descriptor
@@ -308,7 +386,7 @@ float DHT::getComfortRatio(float tCelsius, float humidity, ComfortState& comfort
 		ratio -= distance * kTempFactor;
 	}
 	
-	distance = distanceTooHumid(tCelsius, humidity);
+	distance = m_comfort.distanceTooHumid(temperature, percentHumidity);
 	if(distance > 0)
 	{
 		//update the comfort descriptor
@@ -317,7 +395,7 @@ float DHT::getComfortRatio(float tCelsius, float humidity, ComfortState& comfort
 		ratio -= distance * kHumidFactor;
 	}	
 	
-	distance = distanceTooCold(tCelsius, humidity);
+	distance = m_comfort.distanceTooCold(temperature, percentHumidity);
 	if(distance > 0)
 	{
 		//update the comfort descriptor
@@ -326,7 +404,7 @@ float DHT::getComfortRatio(float tCelsius, float humidity, ComfortState& comfort
 		ratio -= distance * kTempFactor;
 	}
 
-	distance = distanceTooDry(tCelsius, humidity);
+	distance = m_comfort.distanceTooDry(temperature, percentHumidity);
 	if(distance > 0)
 	{
 		//update the comfort descriptor
@@ -335,7 +413,7 @@ float DHT::getComfortRatio(float tCelsius, float humidity, ComfortState& comfort
 		ratio -= distance * kHumidFactor;
 	}
 
-	comfort = (ComfortState)tempComfort;
+	destComfortStatus = (ComfortState)tempComfort;
 
 	if(ratio < 0)
 		ratio = 0;
@@ -363,8 +441,11 @@ void DHT::updateInternalCache()
 			/*Humidity*/
 			m_lastHumid = (((uint32_t)m_data[0])<<8 | m_data[1]) / 10.0f;
 			break;
+		case DHT_AUTO:
+			/*Sensor type unknown yet*/
+			break;
 		default:
-			Serial.println("libDHT: Unknown sensor type");
+			Serial.println("(update)libDHT: Unknown sensor type");
 			break;
 	}
 }
@@ -377,9 +458,14 @@ bool DHT::read(void)
 	unsigned long time = millis();
 
 	//Determine if it's appropiate to read the sensor, or return data from cache
-	if ((time - m_lastreadtime) < m_maxIntervalRead && (errDHT_OK == m_lastError))
+	if ((time - m_lastreadtime) < m_minIntervalRead )
 	{
-		return true; // will use last data from cache
+		if (errDHT_OK == m_lastError)
+			return true; // will use last data from cache
+		else
+		{
+			return false; // must wait
+		}
 	}
 	m_lastreadtime = time;
 
@@ -396,15 +482,7 @@ bool DHT::read(void)
 	//clear interrupts
 	cli();
 	//Make pin input and activate pullup
-	pinMode(m_kSensorPin, INPUT);
-	if (m_bPullupEnabled)
-	{
-		pullup(m_kSensorPin);
-	}
-	else
-	{
-		digitalWrite(m_kSensorPin, HIGH);
-	}
+	PULLUP_PIN(m_kSensorPin);
 
 	//Read in the transitions
 	for (i = 0; i < MAXTIMINGS || j >= 40; i++)
